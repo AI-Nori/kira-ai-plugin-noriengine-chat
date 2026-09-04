@@ -1,0 +1,300 @@
+{
+  "section_basic": {
+    "type": "section",
+    "name": "基础设置",
+    "collapsed": false,
+    "hint": "唤醒词、上下文缓冲与群聊提示词",
+    "locales": {
+      "zh": { "name": "基础设置", "hint": "唤醒词、上下文缓冲与群聊提示词" }
+    },
+    "fields": {
+      "waking_words": {
+        "type": "list",
+        "name": "唤醒词",
+        "default": [],
+        "hint": "消息文本包含任一唤醒词即视为提及（评分直接信号）",
+        "locales": {
+          "zh": { "name": "唤醒词", "hint": "消息文本包含任一唤醒词即视为提及（评分直接信号），每行一个" }
+        }
+      },
+      "max_context_messages": {
+        "type": "integer",
+        "name": "上下文缓冲上限",
+        "default": 5,
+        "hint": "未触发回复的消息保留在缓冲中的最大条数（超出裁剪最旧）",
+        "locales": {
+          "zh": { "name": "上下文缓冲上限", "hint": "未触发回复的消息保留在缓冲中的最大条数（超出裁剪最旧），触发时随上下文一起送入 LLM" }
+        }
+      },
+      "group_chat_prompt": {
+        "type": "markdown",
+        "name": "群聊追加提示词",
+        "default": "",
+        "hint": "群聊批次送入 LLM 前追加到会话环境提示词末尾",
+        "locales": {
+          "zh": { "name": "群聊追加提示词", "hint": "群聊批次送入 LLM 前追加到会话环境提示词末尾" }
+        }
+      }
+    }
+  },
+  "section_trigger": {
+    "type": "section",
+    "name": "触发评分",
+    "collapsed": false,
+    "hint": "评分门控核心参数与时段调度",
+    "locales": {
+      "zh": { "name": "触发评分", "hint": "评分门控核心参数与时段调度" }
+    },
+    "fields": {
+      "trigger_threshold": {
+        "type": "integer",
+        "name": "触发阈值",
+        "default": 80,
+        "hint": "单次评分或累积分达到该值即触发回复（1-200，越高越沉默）",
+        "locales": {
+          "zh": { "name": "触发阈值", "hint": "单次评分或累积分达到该值即触发回复，越高越沉默" }
+        }
+      },
+      "group_reply_chance": {
+        "type": "float",
+        "name": "群聊累积概率",
+        "default": 0.5,
+        "hint": "弱信号每条按“评分 × 该概率”累积（0-1，0 为完全休眠）",
+        "locales": {
+          "zh": { "name": "群聊累积概率", "hint": "弱信号每条按“评分 × 该概率”累积（0-1，0 为时段内完全休眠，强信号同样抑制）" }
+        }
+      },
+      "private_reply_chance": {
+        "type": "float",
+        "name": "私聊回复概率",
+        "default": 1.0,
+        "hint": "私聊每条消息按该概率独立决定是否回复（0-1，1 为每条必回）",
+        "locales": {
+          "zh": { "name": "私聊回复概率", "hint": "私聊每条消息按该概率独立决定是否回复（0-1，1 为每条必回）" }
+        }
+      },
+      "reply_pace": {
+        "type": "float",
+        "name": "回复节奏系数",
+        "default": 1.0,
+        "hint": "越大回复越积极：缩放总分并对积压更敏感，建议 0.5-2.0",
+        "locales": {
+          "zh": { "name": "回复节奏系数", "hint": "越大回复越积极：整体缩放评分且积压消息越容易凑满压力分，建议 0.5-2.0" }
+        }
+      },
+      "merge_wait_seconds": {
+        "type": "float",
+        "name": "合并等待（秒）",
+        "default": 2.0,
+        "hint": "触发后等待该时长合并后续突发消息再送入 LLM（0.1-30）",
+        "locales": {
+          "zh": { "name": "合并等待（秒）", "hint": "触发后等待该时长合并后续突发消息再送入 LLM，等待期内再次触发会顺延" }
+        }
+      },
+      "busy_queue_max": {
+        "type": "integer",
+        "name": "busy 队列上限（条）",
+        "default": 10,
+        "hint": "LLM 回合处理期间的会话缓冲上限（超出裁剪最旧）：回合串行化期间消息持续入队，回合结束后统一刷出",
+        "locales": {
+          "zh": { "name": "busy 队列上限（条）", "hint": "LLM 回合处理期间的会话缓冲上限（超出裁剪最旧）：回合串行化期间消息持续入队，回合结束后统一刷出" }
+        }
+      },
+      "busy_hold_timeout_seconds": {
+        "type": "float",
+        "name": "busy 看门狗超时（秒）",
+        "default": 60,
+        "hint": "回合结束信号失联时的兜底上限：超过该时长强制放行挂起的触发（5-300）；应大于最慢一轮 LLM 回合（含工具调用与多段回复）的耗时，否则串行化会被提前打断",
+        "locales": {
+          "zh": { "name": "busy 看门狗超时（秒）", "hint": "回合结束信号失联时的兜底上限：超过该时长强制放行挂起的触发（5-300）；应大于最慢一轮 LLM 回合（含工具调用与多段回复）的耗时，否则串行化会被提前打断" }
+        }
+      },
+      "burst_window_seconds": {
+        "type": "float",
+        "name": "突发统计窗口（秒）",
+        "default": 5.0,
+        "hint": "最近 N 秒内的消息条数计为积压量（刷屏越快压力分越高），0 为每条独立计",
+        "locales": {
+          "zh": { "name": "突发统计窗口（秒）", "hint": "最近 N 秒内的消息条数计为积压量（刷屏越快压力分越高），0 为每条独立计" }
+        }
+      },
+      "slot_ranges": {
+        "type": "list",
+        "name": "活跃时段（每行一条）",
+        "default": [],
+        "hint": "格式 HH:MM-HH:MM，与下方两个概率列表按行对齐；start>end 表示跨午夜（如 23:00-08:00）；留空表示全天使用基础概率",
+        "locales": {
+          "zh": { "name": "活跃时段（每行一条）", "hint": "格式 HH:MM-HH:MM，与下方两个概率列表按行对齐；start>end 表示跨午夜（如 23:00-08:00）；留空表示全天使用基础概率" }
+        }
+      },
+      "slot_group_chances": {
+        "type": "list",
+        "name": "时段群聊概率（每行一个）",
+        "default": [],
+        "hint": "0-1 数字，第 N 行对应第 N 个时段的群聊累积概率；0 为该时段群聊完全休眠（强信号同样抑制）；缺失行回退 0.5",
+        "locales": {
+          "zh": { "name": "时段群聊概率（每行一个）", "hint": "0-1 数字，第 N 行对应第 N 个时段的群聊累积概率；0 为该时段群聊完全休眠（强信号同样抑制）；缺失行回退 0.5" }
+        }
+      },
+      "slot_private_chances": {
+        "type": "list",
+        "name": "时段私聊概率（每行一个）",
+        "default": [],
+        "hint": "0-1 数字，第 N 行对应第 N 个时段的私聊回复概率；0 为该时段私聊完全休眠；缺失行回退 1.0",
+        "locales": {
+          "zh": { "name": "时段私聊概率（每行一个）", "hint": "0-1 数字，第 N 行对应第 N 个时段的私聊回复概率；0 为该时段私聊完全休眠；缺失行回退 1.0" }
+        }
+      }
+    }
+  },
+  "section_wordlists": {
+    "type": "section",
+    "name": "信号词表",
+    "collapsed": true,
+    "hint": "内容评分信号词，命中越多得分越高（每行一个词）",
+    "locales": {
+      "zh": { "name": "信号词表", "hint": "内容评分信号词，命中越多得分越高（每行一个词），留空恢复默认" }
+    },
+    "fields": {
+      "question_terms": {
+        "type": "list",
+        "name": "提问词（+15 分）",
+        "default": ["怎么", "如何", "为什么", "有没有"],
+        "hint": "命中任一词视为提问信号",
+        "locales": {
+          "zh": { "name": "提问词（+15 分）", "hint": "命中任一词视为提问信号" }
+        }
+      },
+      "seek_terms": {
+        "type": "list",
+        "name": "直接请求词（+20 分）",
+        "default": ["帮我", "帮忙", "能不能", "可以吗", "要不要"],
+        "hint": "命中任一词视为请求信号",
+        "locales": {
+          "zh": { "name": "直接请求词（+20 分）", "hint": "命中任一词视为请求信号" }
+        }
+      },
+      "casual_seek_terms": {
+        "type": "list",
+        "name": "弱请求词（+20 分，仅直接上下文）",
+        "default": ["需要", "求", "看看", "试试"],
+        "hint": "仅在 @/提及/私聊等直接上下文中生效",
+        "locales": {
+          "zh": { "name": "弱请求词（+20 分，仅直接上下文）", "hint": "仅在 @/提及/私聊等直接上下文中生效" }
+        }
+      },
+      "opinion_terms": {
+        "type": "list",
+        "name": "征询词（+20 分）",
+        "default": ["你觉得", "你认为", "咋看", "有什么建议"],
+        "hint": "征询意见/看法类信号",
+        "locales": {
+          "zh": { "name": "征询词（+20 分）", "hint": "征询意见/看法类信号" }
+        }
+      },
+      "low_content_replies": {
+        "type": "list",
+        "name": "低价值短语（-25 分）",
+        "default": ["哈哈", "哈哈哈", "草", "笑死", "好", "嗯", "啊", "哦", "6", "666", "？", "?"],
+        "hint": "整批消息均为此类短语时扣分",
+        "locales": {
+          "zh": { "name": "低价值短语（-25 分）", "hint": "整批消息均为此类短语时扣分" }
+        }
+      },
+      "rival_ai_names": {
+        "type": "list",
+        "name": "其他 AI 名单",
+        "default": ["DeepSeek", "ChatGPT", "Grok", "豆包", "千问", "元宝", "通义", "Kimi", "Claude"],
+        "hint": "无提及时消息开头点名这些 AI 的请求不视为对 bot 的请求",
+        "locales": {
+          "zh": { "name": "其他 AI 名单", "hint": "无提及时，消息开头点名这些 AI 的请求（如“DeepSeek，帮我…”）不视为对 bot 的请求" }
+        }
+      }
+    }
+  },
+  "section_presence": {
+    "type": "section",
+    "name": "存在感抑制",
+    "collapsed": true,
+    "hint": "bot 近期发言占比过高时自动降低触发分",
+    "locales": {
+      "zh": { "name": "存在感抑制", "hint": "bot 近期发言占比过高时自动降低触发分" }
+    },
+    "fields": {
+      "presence_window_size": {
+        "type": "integer",
+        "name": "统计窗口（条）",
+        "default": 20,
+        "hint": "取最近 N 条消息计算 bot 发言占比",
+        "locales": {
+          "zh": { "name": "统计窗口（条）", "hint": "取最近 N 条消息计算 bot 发言占比" }
+        }
+      },
+      "presence_decay_minutes": {
+        "type": "float",
+        "name": "时间衰减（分钟）",
+        "default": 10,
+        "hint": "仅统计最近 N 分钟内的消息，0 为只用条数窗口",
+        "locales": {
+          "zh": { "name": "时间衰减（分钟）", "hint": "仅统计最近 N 分钟内的消息，0 为只用条数窗口" }
+        }
+      }
+    }
+  },
+  "section_poke": {
+    "type": "section",
+    "name": "戳一戳",
+    "collapsed": true,
+    "hint": "戳一戳事件评分累积与机械回戳",
+    "locales": {
+      "zh": { "name": "戳一戳", "hint": "戳一戳事件评分累积与机械回戳" }
+    },
+    "fields": {
+      "poke_gate_enabled": {
+        "type": "switch",
+        "name": "启用戳一戳门控",
+        "default": true,
+        "hint": "被戳不直接触发回复，按基础分累积评分（不受时段概率影响）；关闭后走普通消息评分",
+        "locales": {
+          "zh": { "name": "启用戳一戳门控", "hint": "被戳不直接触发回复，按基础分累积评分（不受时段概率影响）；关闭后走普通消息评分" }
+        }
+      },
+      "poke_base_score": {
+        "type": "integer",
+        "name": "戳一戳基础分",
+        "default": 30,
+        "hint": "每次被戳累积的分数（默认阈值 80，即第 3 次被戳触发回复）",
+        "locales": {
+          "zh": { "name": "戳一戳基础分", "hint": "每次被戳累积的分数（默认阈值 80，即第 3 次被戳触发回复）" }
+        }
+      },
+      "poke_back_enabled": {
+        "type": "switch",
+        "name": "机械回戳",
+        "default": false,
+        "hint": "累积未达回复阈值时自动戳回发起者",
+        "locales": {
+          "zh": { "name": "机械回戳", "hint": "累积未达回复阈值时自动戳回发起者" }
+        }
+      },
+      "poke_back_cooldown_seconds": {
+        "type": "float",
+        "name": "回戳冷却（秒）",
+        "default": 3,
+        "hint": "全局冷却：多人/多会话同时戳共用同一节流窗口",
+        "locales": {
+          "zh": { "name": "回戳冷却（秒）", "hint": "全局冷却：多人/多会话同时戳共用同一节流窗口" }
+        }
+      },
+      "poke_back_max": {
+        "type": "integer",
+        "name": "连续回戳上限",
+        "default": 3,
+        "hint": "会话级连续机械回戳次数上限，累计满后仅保留积分；bot 产生任意回复时清零，0 为不限制",
+        "locales": {
+          "zh": { "name": "连续回戳上限", "hint": "会话级连续机械回戳次数上限，累计满后仅保留积分；bot 产生任意回复时清零，0 为不限制" }
+        }
+      }
+    }
+  }
+}

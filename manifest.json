@@ -1,0 +1,21 @@
+{
+  "display_name": "NoriEngine Chat",
+  "plugin_id": "kira-ai-plugin-noriengine-chat",
+  "version": "1.4.2",
+  "core_version": ">=2.31.0",
+  "author": "skyzhishui",
+  "description": "KiraAI 群聊增强插件。评分引擎决定 AI 何时参与对话：强信号直通、弱信号累积、时段调度、存在感抑制、戳一戳评分与机械回戳。启用本插件前请先停用 默认聊天。",
+  "tags": [
+    "chat",
+    "im"
+  ],
+  "icon": "icon.svg",
+  "icon-dark": "icon-dark.svg",
+  "repo": "https://github.com/skyzhishui/kira-ai-plugin-noriengine-chat",
+  "locales": {
+    "zh": {
+      "display_name": "NoriEngine Chat",
+      "description": "KiraAI 群聊增强插件。评分引擎决定 AI 何时参与对话：强信号直通、弱信号累积、时段调度、存在感抑制、戳一戳评分与机械回戳。启用本插件前请先停用 默认聊天。"
+    }
+  }
+}
