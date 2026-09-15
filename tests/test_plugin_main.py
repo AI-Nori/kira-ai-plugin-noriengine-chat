@@ -159,23 +159,6 @@ class _FakePokeClient:
         self.calls.append((str(user_id), group_id))
 
 
-class _FakeEventBus:
-    """Event bus stub recording subscriptions (string-key multicast
-    semantics of SystemEvent)."""
-
-    def __init__(self):
-        self.subs: dict[str, list] = {}
-
-    def subscribe(self, event_type, handler):
-        self.subs.setdefault(event_type, []).append(handler)
-
-    def unsubscribe(self, event_type, handler):
-        try:
-            self.subs.get(event_type, []).remove(handler)
-        except ValueError:
-            pass
-
-
 class _FakeMessageProcessor:
     """Mirror of the real MessageProcessor.flush_session_messages: drain the
     session buffer, publish a batch, return whether one was published."""
@@ -205,7 +188,6 @@ class _FakeCtx:
         self.buffers: dict[str, _FakeBuffer] = {}
         self.flushed: list[str] = []
         self.adapter_mgr = _FakeAdapterManager(poke_client)
-        self.event_bus = _FakeEventBus()
         self.message_processor = _FakeMessageProcessor(self)
 
     def get_buffer(self, sid: str) -> _FakeBuffer:
@@ -922,10 +904,12 @@ class TestDebounceIdleExit:
             await asyncio.sleep(1.0)
             assert GROUP_SID not in plugin.flush_tasks
             # Simulate the host round-end signal (the fake environment
-            # publishes no session_memory_updated); otherwise the busy state
+            # dispatches no on-final-result); otherwise the busy state
             # after the first flush would defer the second trigger instead
             # of recreating the task
-            plugin._release_busy(GROUP_SID, reason="test")
+            await plugin._on_final_result(
+                _batch_event_for(GROUP_SID, ctx), _final_result_event()
+            )
             # New trigger after the idle exit: _arm_flush must rebuild the
             # task/event and flush normally
             await plugin.handle_msg(_group_event(ctx, _FakeAt(SELF_ID), _FakeText("还在吗")))
@@ -1039,12 +1023,196 @@ class TestConfigWarnings:
         assert plugin.gates.all_sids() == []
 
 
-def _memory_updated_event(sid: str):
-    """Minimal stand-in for the host session_memory_updated SystemEvent."""
-    return types.SimpleNamespace(
-        event_type="session_memory_updated",
-        payload={"session": sid, "new_chunk": []},
-    )
+def _final_result_event():
+    """Minimal stand-in for the host round-end hook payload (KiraFinalResult)."""
+    return types.SimpleNamespace(step_results=[])
+
+
+def _batch_event_for(sid: str, ctx: "_FakeCtx") -> "_FakeEvent":
+    """Minimal batch-event stand-in for driving the round-end hook."""
+    return _FakeEvent(_FakeMessage([], group=_FakeGroup()), sid, ctx)
+
+
+def _sid_event(ctx: "_FakeCtx", sid: str, text: str) -> "_FakeEvent":
+    """Group text event on an arbitrary sid (cluster-branch sessions)."""
+    return _FakeEvent(_FakeMessage([_FakeText(text)], group=_FakeGroup()), sid, ctx)
+
+
+class TestFollowupWindow:
+    """Topic continuity: the per-message follow-up tier anchored at the
+    bot's last reply. One trunk scenario — default off → in-window boost →
+    threshold crossing → window expiry — with branch assertions inline."""
+
+    def test_followup_window_lifecycle(self):
+        # Branch 0: feature is disabled by default (no tasks started, so no
+        # terminate needed for the throwaway instance)
+        default_plugin, _ = _make_plugin()
+        assert default_plugin.followup_window == 0.0
+
+        plugin, ctx = _make_plugin(
+            {"section_trigger": {"followup_window_seconds": 10.0,
+                                 "group_reply_chance": 1.0,
+                                 "merge_wait_seconds": 0.1}}
+        )
+        gate = plugin.gates.get(GROUP_SID)
+
+        async def scenario():
+            # Phase 1: bot replied just now → follow-up earns the 50 tier
+            # 50(话题延续) + 6(积压) - 18(存在感抑制 1/2 占比) = 38，×1.0 累积
+            gate.note_bot_reply(time.time())
+            await plugin.handle_msg(_group_event(ctx, _FakeText("今天天气不错")))
+            assert gate.pending_score == pytest.approx(38.0)
+            assert ctx.flushed == []
+
+            # Phase 2: second follow-up still in window — accumulated heat
+            # crosses 80 → 累积触发并刷出（触发点清零累积分）
+            await plugin.handle_msg(_group_event(ctx, _FakeText("就是随便聊聊而已")))
+            # 38 + [50(话题延续) + 22(2条突发积压) - 6(抑制 1/3)] = 104 ≥ 80
+            await asyncio.sleep(0.3)
+            assert ctx.flushed == [GROUP_SID]
+            assert gate.pending_score == 0.0
+
+            # Phase 3: bot's latest timeline entry is now 30s old — beyond
+            # the 10s window → plain scoring, no tier (appending the stale
+            # bot entry makes it the latest anchor scanned from the right)
+            gate.note_bot_reply(time.time() - 30.0)
+            gate.pending_score = 50.0
+            await plugin.handle_msg(_group_event(ctx, _FakeText("接着说")))
+            await asyncio.sleep(0.3)
+            # 无延续档：0 + 30(3条积压封顶) - 11(抑制 2/5) = 19 → 69 < 80 不触发
+            assert ctx.flushed == [GROUP_SID]
+            assert gate.pending_score == pytest.approx(69.0)
+            await plugin.terminate()
+
+        asyncio.run(scenario())
+
+
+class TestClusterGate:
+    """Topic-cluster detection: per-message heat condition sampled from
+    prior participants; the bonus accumulates unscaled by slot probability.
+    One trunk: default off → hot cluster boosts unscaled → same-user /
+    content-less clusters never light → rapid burst reaches the threshold."""
+
+    def test_cluster_gate_lifecycle(self):
+        # Branch 0: master switch off by default — the switch (not the
+        # window) is the on/off control, so the window default stays 30
+        default_plugin, _ = _make_plugin()
+        assert default_plugin.cluster_gate_enabled is False
+        assert default_plugin.cluster_window == 30.0
+
+        plugin, ctx = _make_plugin(
+            {"section_trigger": {"cluster_gate_enabled": True,
+                                 "cluster_window_seconds": 30,
+                                 "cluster_min_users": 3,
+                                 "cluster_bonus": 50,
+                                 "group_reply_chance": 0.5,
+                                 "merge_wait_seconds": 0.1}}
+        )
+
+        async def scenario():
+            now = time.time()
+            # Phase 1: 3 distinct users with real content, spread beyond the
+            # 5s burst window → hot. Verdict 50(聚集)+6(积压)+15(闲时)=71 < 80;
+            # accumulation keeps the bonus unscaled: (71-50)×0.5+50 = 60.5
+            # (diluting the whole verdict by 0.5 would only give 35.5)
+            gate = plugin.gates.get(GROUP_SID)
+            gate.note_incoming(now - 25, sender="u1", low_value=False)
+            gate.note_incoming(now - 20, sender="u2", low_value=False)
+            gate.note_incoming(now - 15, sender="u3", low_value=False)
+            await plugin.handle_msg(_group_event(ctx, _FakeText("我也有同感")))
+            assert gate.pending_score == pytest.approx(60.5)
+            assert ctx.flushed == []
+
+            # Phase 2: one user spamming never completes a cluster —
+            # verdict 21(6积压+15闲时)×0.5，无加成
+            sid_b = "napcat:gm:999999"
+            gate_b = plugin.gates.get(sid_b)
+            for ts in (now - 25, now - 20, now - 15):
+                gate_b.note_incoming(ts, sender="u1", low_value=False)
+            await plugin.handle_msg(_sid_event(ctx, sid_b, "我也有同感"))
+            assert gate_b.pending_score == pytest.approx(10.5)
+
+            # Phase 3: distinct users but all low-value content → cold
+            sid_c = "napcat:gm:888888"
+            gate_c = plugin.gates.get(sid_c)
+            for idx, ts in enumerate((now - 25, now - 20, now - 15)):
+                gate_c.note_incoming(ts, sender=f"u{idx}", low_value=True)
+            await plugin.handle_msg(_sid_event(ctx, sid_c, "我也有同感"))
+            assert gate_c.pending_score == pytest.approx(10.5)
+
+            # Phase 4: rapid 3-user burst inside the 5s window → backlog
+            # caps at 30 → 50+30 = 80 reaches the threshold → strong
+            # trigger and flush
+            sid_d = "napcat:gm:777777"
+            gate_d = plugin.gates.get(sid_d)
+            gate_d.note_incoming(now - 3, sender="u1", low_value=False)
+            gate_d.note_incoming(now - 2, sender="u2", low_value=False)
+            gate_d.note_incoming(now - 1, sender="u3", low_value=False)
+            await plugin.handle_msg(_sid_event(ctx, sid_d, "我也有同感"))
+            await asyncio.sleep(0.3)
+            assert ctx.flushed == [sid_d]
+            await plugin.terminate()
+
+        asyncio.run(scenario())
+
+
+class TestTopicFeatureScope:
+    """Session scoping of the two topic features: an empty session list
+    means global, a non-empty list enables the feature only for the listed
+    sessions. One trunk per feature with an in-scope / out-of-scope branch."""
+
+    def test_topic_features_session_scope(self):
+        # Branch 0: default scopes are empty → both features act globally
+        default_plugin, _ = _make_plugin()
+        assert default_plugin.followup_sessions == frozenset()
+        assert default_plugin.cluster_sessions == frozenset()
+
+        sid_scoped = "napcat:gm:444444"
+        plugin, ctx = _make_plugin(
+            {"section_trigger": {
+                "followup_window_seconds": 10,
+                "followup_sessions": [GROUP_SID],
+                "cluster_gate_enabled": True,
+                "cluster_sessions": [sid_scoped],
+                "group_reply_chance": 1.0,
+            }}
+        )
+
+        async def scenario():
+            now = time.time()
+            # Topic-continuity branch: same fresh bot reply on both sessions
+            # — only the in-scope one earns the tier (38)；the out-of-scope
+            # verdict clamps to 0 (6 积压 - 18 抑制)
+            gate_a = plugin.gates.get(GROUP_SID)
+            gate_a.note_bot_reply(now)
+            await plugin.handle_msg(_group_event(ctx, _FakeText("今天天气不错")))
+            assert gate_a.pending_score == pytest.approx(38.0)
+
+            sid_b = "napcat:gm:555555"
+            gate_b = plugin.gates.get(sid_b)
+            gate_b.note_bot_reply(now)
+            await plugin.handle_msg(_sid_event(ctx, sid_b, "今天天气不错"))
+            assert gate_b.pending_score == 0.0
+
+            # Cluster branch: identical 3-user hot clusters on both sessions
+            # — only the in-scope one gets the bonus (71 vs 21)
+            gate_c = plugin.gates.get(sid_scoped)
+            gate_c.note_incoming(now - 25, sender="u1", low_value=False)
+            gate_c.note_incoming(now - 20, sender="u2", low_value=False)
+            gate_c.note_incoming(now - 15, sender="u3", low_value=False)
+            await plugin.handle_msg(_sid_event(ctx, sid_scoped, "我也有同感"))
+            assert gate_c.pending_score == pytest.approx(71.0)
+
+            sid_d = "napcat:gm:666666"
+            gate_d = plugin.gates.get(sid_d)
+            gate_d.note_incoming(now - 25, sender="u1", low_value=False)
+            gate_d.note_incoming(now - 20, sender="u2", low_value=False)
+            gate_d.note_incoming(now - 15, sender="u3", low_value=False)
+            await plugin.handle_msg(_sid_event(ctx, sid_d, "我也有同感"))
+            assert gate_d.pending_score == pytest.approx(21.0)
+            await plugin.terminate()
+
+        asyncio.run(scenario())
 
 
 class TestBusyQueue:
@@ -1075,17 +1243,20 @@ class TestBusyQueue:
 
         async def scenario():
             await plugin.initialize()
-            handler = ctx.event_bus.subs["session_memory_updated"][-1]
             plugin._mark_busy(GROUP_SID)
             await plugin.handle_msg(_group_event(ctx, _FakeAt(SELF_ID), _FakeText("在吗")))
             assert GROUP_SID in plugin.deferred_sids
-            # Round-end events of other sessions must not affect this
+            # Round-end hooks of other sessions must not affect this
             # session's busy state
-            await handler(_memory_updated_event("napcat:gm:999999"))
+            await plugin._on_final_result(
+                _batch_event_for("napcat:gm:999999", ctx), _final_result_event()
+            )
             assert GROUP_SID in plugin.busy_sessions
             # This session's round ends → release the deferred trigger →
             # flush through the merge window
-            await handler(_memory_updated_event(GROUP_SID))
+            await plugin._on_final_result(
+                _batch_event_for(GROUP_SID, ctx), _final_result_event()
+            )
             assert GROUP_SID not in plugin.busy_sessions
             await asyncio.sleep(0.3)
             await plugin.terminate()
@@ -1104,13 +1275,14 @@ class TestBusyQueue:
 
         async def scenario():
             await plugin.initialize()
-            handler = ctx.event_bus.subs["session_memory_updated"][-1]
             await plugin.handle_msg(_group_event(ctx, _FakeAt(SELF_ID), _FakeText("在吗")))
             await asyncio.sleep(0.3)  # merge window passed, flush published
             assert ctx.flushed == [GROUP_SID]
             # Round still in flight: busy must hold
             assert GROUP_SID in plugin.busy_sessions
-            await handler(_memory_updated_event(GROUP_SID))
+            await plugin._on_final_result(
+                _batch_event_for(GROUP_SID, ctx), _final_result_event()
+            )
             assert GROUP_SID not in plugin.busy_sessions
             await plugin.terminate()
 
@@ -1241,22 +1413,18 @@ class TestBusyQueue:
         assert gate.pending_score == 90.0
         assert ctx.flushed == []
 
-    def test_terminate_cleans_busy_state_and_unsubscribes(self):
+    def test_terminate_cleans_busy_state(self):
         plugin, ctx = _make_plugin()
-        bus = ctx.event_bus
 
         async def scenario():
-            # Hot-reload re-entry: repeated initialize must not subscribe
-            # twice
+            # Hot-reload re-entry: initialize must stay re-entrant
             await plugin.initialize()
             await plugin.initialize()
-            assert len(bus.subs["session_memory_updated"]) == 1
             plugin._mark_busy(GROUP_SID)
             plugin.deferred_sids.add(GROUP_SID)
             await plugin.terminate()
 
         asyncio.run(scenario())
-        assert bus.subs.get("session_memory_updated", []) == []
         assert plugin.busy_sessions == set()
         assert plugin.deferred_sids == set()
         assert plugin.busy_watchdogs == {}

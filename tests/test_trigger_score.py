@@ -354,6 +354,78 @@ class TestEvaluateTriggerScore:
         assert find_request_hint("DeepSeek，帮我看看", words, direct_context=False) == "帮我"
 
 
+class TestFollowupTier:
+    """Topic continuity: the follow-up direct-signal tier (per-message,
+    between mention 80 and private 40). One trunk scenario with branch
+    assertions on the same snapshot shape."""
+
+    def test_followup_tier_scoring(self):
+        # Branch 1: base tier — 50 alone stays below the default threshold
+        verdict = evaluate_trigger_score(
+            _snapshot(texts=["今天天气不错"], followup=True, followup_score=50, pending_count=0)
+        )
+        assert "直接信号=50(话题延续)" in verdict.breakdown
+        assert verdict.score == 50
+
+        # Branch 2: grants direct context — casual seek term "看看"
+        # (direct-only) becomes effective, low-value penalty still applies
+        unlocked = evaluate_trigger_score(
+            _snapshot(texts=["看看这个"], followup=True, followup_score=50, pending_count=0)
+        )
+        assert "请求:看看" in unlocked.breakdown
+        assert unlocked.score == 70
+        assert evaluate_trigger_score(
+            _snapshot(texts=["哈哈"], followup=True, followup_score=50, pending_count=0)
+        ).score == 25
+
+        # Branch 3: stronger direct tiers dominate the followup tier
+        assert "直接信号=100(@)" in evaluate_trigger_score(
+            _snapshot(texts=["在吗"], has_at=True, followup=True, followup_score=50, pending_count=0)
+        ).breakdown
+        assert "直接信号=80(提及)" in evaluate_trigger_score(
+            _snapshot(
+                texts=["好的收到"], has_mention=True, followup=True, followup_score=50,
+                pending_count=0, backlog_norm=1,
+            )
+        ).breakdown
+
+
+class TestClusterBonus:
+    """Topic-cluster bonus: additive (grants no direct context) and its
+    verdict share is exposed as ``unscaled`` so the accumulation call site
+    can bypass slot-probability dilution."""
+
+    def test_cluster_bonus_scoring(self):
+        # Branch 1: hot cluster adds the bonus; casual seek terms stay
+        # locked — ambient heat is not directed at the bot
+        v = evaluate_trigger_score(
+            _snapshot(texts=["看看这个"], cluster_hot=True, cluster_bonus=50, pending_count=0)
+        )
+        assert v.score == 50 and v.unscaled == 50
+        assert "话题聚集=50" in v.breakdown
+        assert "请求:看看" not in v.breakdown
+
+        # Branch 2: pace scaling moves score and unscaled together
+        # (multiplier 0.5+0.5×0.5=0.75 → round(50×0.75)=38)
+        v2 = evaluate_trigger_score(
+            _snapshot(
+                texts=["看看这个"], cluster_hot=True, cluster_bonus=50,
+                pending_count=0, pace_factor=0.5,
+            )
+        )
+        assert v2.score == 38 and v2.unscaled == 38
+
+        # Branch 3: heavy suppression can shrink the unscaled share — it is
+        # capped at the final score, so presence suppression still brakes it
+        v3 = evaluate_trigger_score(
+            _snapshot(
+                texts=["哈哈"], cluster_hot=True, cluster_bonus=50, pending_count=0,
+                bot_recent_replies=15, recent_window_total=20,
+            )
+        )
+        assert v3.score == 0 and v3.unscaled == 0
+
+
 class TestBacklogNotScaled:
     """Backlog points are never scaled by slot probability: verdict and
     accumulation share the same score, the cap of 30 is consumed as-is."""

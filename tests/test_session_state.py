@@ -271,6 +271,41 @@ class TestSessionGate:
         _, above = gate.idle_state(1070.0)  # idle 10s < 30s
         assert above is False
 
+    def test_seconds_since_last_bot_reply(self):
+        # No bot entry in the timeline → None (window cannot anchor)
+        gate = SessionGate()
+        gate.note_incoming(1000.0)
+        assert gate.seconds_since_last_bot_reply(1005.0) is None
+        # Anchors at the LATEST bot entry (scans from the right, external
+        # entries in between are transparent)
+        gate.note_bot_reply(1010.0)
+        gate.note_incoming(1012.0)
+        gate.note_bot_reply(1015.0)
+        assert gate.seconds_since_last_bot_reply(1020.0) == 5.0
+        # Clamped to 0 when queried at/before the anchor
+        assert gate.seconds_since_last_bot_reply(1015.0) == 0.0
+
+    def test_cluster_stats(self):
+        # Trunk: distinct-sender counting + content flag + exclusions +
+        # window expiry, over one seeded timeline
+        gate = SessionGate()
+        assert gate.cluster_stats(1000.0, window_seconds=30) == (0, False)
+        gate.note_incoming(975.0, sender="u1", low_value=False)
+        gate.note_incoming(980.0, sender="u1", low_value=False)  # same sender dedups
+        gate.note_bot_reply(985.0)                               # bot entries excluded
+        gate.note_incoming(990.0, sender="u2", low_value=True)  # low-value: no content credit
+        gate.note_incoming(995.0)                                # anonymous (e.g. poke): never a sender
+        users, has_content = gate.cluster_stats(1000.0, window_seconds=30)
+        assert users == 2
+        assert has_content is True
+        # Branch: an all-low-value cluster never lights the content flag
+        gate2 = SessionGate()
+        gate2.note_incoming(980.0, sender="u1", low_value=True)
+        gate2.note_incoming(985.0, sender="u2", low_value=True)
+        assert gate2.cluster_stats(990.0, window_seconds=30) == (2, False)
+        # Branch: the window slides past everything
+        assert gate.cluster_stats(1030.0, window_seconds=30) == (0, False)
+
 
 class TestGateRegistry:
     def test_get_creates_and_reuses(self):

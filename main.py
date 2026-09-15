@@ -25,12 +25,23 @@ Core behavior:
   mechanical poke-back may fire (global cooldown + per-session consecutive
   cap, only successful poke-backs are counted; any bot reply resets the cap
   counter);
+- Topic continuity (follow-up window, off by default): every group message
+  scored within N seconds after the bot's last reply earns a fixed
+  direct-signal relevance tier (default 50 when enabled), keeping the bot
+  engaged through an active exchange without per-question auto-reply;
+- Topic-cluster detection (off by default): when enough distinct
+  participants (default 3) post real content within a window (default
+  30s), every message scored while the topic is hot earns an additive
+  bonus (default 50) that accumulates without slot-probability dilution;
+- Both topic features are session-scoped: an empty session list means
+  global, a non-empty list enables the feature only for the listed
+  sessions;
 - After a trigger, the whole buffer is flushed through a short merge window
   (debounce) and handed to the native KiraAI LLM pipeline;
 - LLM round serialization (busy queue): the host dispatches batch events
   per session concurrently — two concurrent LLM rounds on the same session
   would race on stale memory and interleave replies. While a round is in
-  flight (from flush publish until the session-memory-updated event), new
+  flight (from flush publish until the on-final-result hook), new
   triggers do not start a concurrent round: they are deferred while keeping
   the accumulated score, and flushed together through a merge window after
   the round ends; the buffer cap is enlarged during busy periods to reduce
@@ -43,6 +54,7 @@ import os
 import random
 import sys
 import time
+from dataclasses import dataclass, field
 from datetime import datetime
 
 # The plugin manager loads main.py via spec_from_file_location, which does NOT
@@ -65,7 +77,15 @@ from noriengine_session_state import (
     parse_time_slots,
     resolve_active_chances,
 )
-from noriengine_trigger_score import SignalWordlists, TriggerSnapshot, evaluate_trigger_score
+from noriengine_trigger_score import (
+    CLUSTER_BONUS_POINTS,
+    FOLLOWUP_BASE_POINTS,
+    SignalWordlists,
+    TriggerSnapshot,
+    clean_chat_text,
+    evaluate_trigger_score,
+    is_low_content_batch,
+)
 
 _PRUNE_INTERVAL_SECONDS = 3600
 _SESSION_STALE_SECONDS = 7 * 24 * 3600
@@ -75,6 +95,20 @@ _SESSION_STALE_SECONDS = 7 * 24 * 3600
 # reclaimable by prune — otherwise flush structures would grow unboundedly
 # with the number of historical sessions over long runtimes
 _DEBOUNCE_IDLE_EXIT_SECONDS = 3600.0
+
+
+@dataclass(frozen=True)
+class _ChainScan:
+    """One-pass parse of a message chain, shared by the timeline entry
+    (``low_value`` feeds topic-cluster detection) and the scoring snapshot
+    — a single source of truth, so the cluster's content judgment can never
+    drift from the verdict's low-value judgment."""
+
+    texts: list[str] = field(default_factory=list)
+    has_at_bot: bool = False
+    has_media: bool = False
+    has_weak_media: bool = False
+    low_value: bool = True
 
 
 class NoriEngineChatPlugin(BasePlugin):
@@ -98,7 +132,6 @@ class NoriEngineChatPlugin(BasePlugin):
         self.deferred_sids: set[str] = set()
         self.busy_watchdogs: dict[str, asyncio.Task] = {}
         self.flush_pending: set[str] = set()
-        self._round_end_subscribed = False
         self._load_config()
 
     # ------------------------------------------------------------------
@@ -118,6 +151,22 @@ class NoriEngineChatPlugin(BasePlugin):
                 return float(section.get(key, fallback))
             except (TypeError, ValueError):
                 return fallback
+
+        def _as_sid_set(key: str) -> frozenset[str]:
+            """Session-scope list: empty/missing means global (enabled for
+            every session); a non-empty list enables only the listed
+            sessions. Invalid type falls back to global with a warning."""
+
+            raw = gate_cfg.get(key)
+            if raw is None:
+                return frozenset()
+            if not isinstance(raw, (list, tuple)):
+                logger.warning(
+                    f"[NoriEngineChat] {key} 配置类型非法（{type(raw).__name__}），"
+                    f"需为字符串数组，已回退为空（全局生效）"
+                )
+                return frozenset()
+            return frozenset(str(s).strip() for s in raw if str(s).strip())
 
         # -- Basic --
         basic = pc.get("section_basic", {}) or {}
@@ -151,6 +200,32 @@ class NoriEngineChatPlugin(BasePlugin):
         self.busy_hold_timeout = min(
             300.0, max(5.0, _as_float(gate_cfg, "busy_hold_timeout_seconds", 60.0))
         )
+        # Topic continuity: messages scored within this window after the
+        # bot's last reply earn the follow-up direct-signal tier (0 = off);
+        # followup_sessions scopes it — empty = global, otherwise only the
+        # listed sessions
+        self.followup_window = min(
+            300.0, max(0.0, _as_float(gate_cfg, "followup_window_seconds", 0.0))
+        )
+        self.followup_score = max(
+            0, _as_int(gate_cfg, "followup_score", FOLLOWUP_BASE_POINTS)
+        )
+        self.followup_sessions = _as_sid_set("followup_sessions")
+        # Topic-cluster detection: enough distinct participants with real
+        # content inside the window make the topic "hot"; every message
+        # scored while hot earns the bonus, accumulated without
+        # slot-probability dilution. Master switch, off by default (same
+        # pattern as poke_gate_enabled); cluster_sessions scopes it the
+        # same way as followup_sessions
+        self.cluster_gate_enabled = bool(gate_cfg.get("cluster_gate_enabled", False))
+        self.cluster_window = min(
+            600.0, max(0.0, _as_float(gate_cfg, "cluster_window_seconds", 30.0))
+        )
+        self.cluster_min_users = max(1, _as_int(gate_cfg, "cluster_min_users", 3))
+        self.cluster_bonus = max(
+            0, _as_int(gate_cfg, "cluster_bonus", CLUSTER_BONUS_POINTS)
+        )
+        self.cluster_sessions = _as_sid_set("cluster_sessions")
 
         # -- Time-slot scheduling: prefer the visual parallel lists, keep the
         #    legacy JSON-array config as a fallback --
@@ -206,37 +281,33 @@ class NoriEngineChatPlugin(BasePlugin):
             self.flush_events.pop(sid, None)
         for sid in [s for s, t in self.busy_watchdogs.items() if t.done()]:
             self.busy_watchdogs.pop(sid, None)
-        # Subscribe to the host session-memory-updated event (published by
-        # update_memory, the last step of every batch round) as the precise
-        # LLM round-end signal; same subscription style as session_media_manager
-        bus = getattr(self.ctx, "event_bus", None)
-        if bus is not None and not self._round_end_subscribed:
-            bus.subscribe("session_memory_updated", self._on_session_memory_updated)
-            self._round_end_subscribed = True
         if self.prune_task is None or self.prune_task.done():
             self.prune_task = asyncio.create_task(self._prune_loop())
         logger.info(
             "[NoriEngineChat] initialized: threshold=%d pace=%.2f group=%.2f private=%.2f "
             "merge_wait=%.1fs slots=%d wake_words=%d poke_gate=%s(+%d) "
-            "poke_back=%s(cooldown=%.1fs max=%d) busy_queue=%d hold_timeout=%.0fs",
+            "poke_back=%s(cooldown=%.1fs max=%d) busy_queue=%d hold_timeout=%.0fs "
+            "followup=%s(window=%.0fs score=%d scope=%s) "
+            "cluster=%s(window=%.0fs users=%d bonus=%d scope=%s)",
             self.trigger_threshold, self.reply_pace, self.group_reply_chance,
             self.private_reply_chance, self.merge_wait, len(self.time_slots),
             len(self.waking_words),
             self.poke_gate_enabled, self.poke_base_score,
             self.poke_back_enabled, self.poke_back_cooldown_seconds, self.poke_back_max,
             self.busy_queue_max, self.busy_hold_timeout,
+            "on" if self.followup_window > 0.0 and self.followup_score > 0 else "off",
+            self.followup_window, self.followup_score,
+            "all" if not self.followup_sessions else f"{len(self.followup_sessions)}个会话",
+            "on" if (
+                self.cluster_gate_enabled
+                and self.cluster_window > 0.0
+                and self.cluster_bonus > 0
+            ) else "off",
+            self.cluster_window, self.cluster_min_users, self.cluster_bonus,
+            "all" if not self.cluster_sessions else f"{len(self.cluster_sessions)}个会话",
         )
 
     async def terminate(self):
-        # Unsubscribe the round-end event (hot-reload safe: bound methods
-        # compare by instance, so other subscribers are unaffected)
-        bus = getattr(self.ctx, "event_bus", None)
-        if bus is not None and self._round_end_subscribed:
-            try:
-                bus.unsubscribe("session_memory_updated", self._on_session_memory_updated)
-            except (KeyError, ValueError):
-                pass
-            self._round_end_subscribed = False
         # Cancel first, then gather everything, so no pending task is left
         # behind to trigger "Task was destroyed but it is pending" warnings
         # when the event loop shuts down
@@ -301,13 +372,31 @@ class NoriEngineChatPlugin(BasePlugin):
             buffer.pop(count=buffer.get_length() - cap + 1)
         event.buffer()
 
-        # Activity timeline entry (presence / idle statistics). Idle is
-        # sampled BEFORE recording the current message: idle measures the
-        # quiet gap since the previous external message, and note_incoming
-        # would make the current message the latest entry (idle always 0)
+        # Activity timeline entry (presence / idle statistics). Idle and the
+        # topic-cluster condition are sampled BEFORE recording the current
+        # message: idle measures the quiet gap since the previous external
+        # message (note_incoming would make idle always 0), and the cluster
+        # must be completed by PRIOR participants — the current message
+        # must not complete it and then boost itself. The chain is parsed
+        # once here: the scan's low_value goes into the timeline entry and
+        # the whole scan is reused by _build_snapshot (single traversal)
         gate = self.gates.get(sid)
+        scan = self._scan_chain(event)
         _, idle_above_avg = gate.idle_state(now)
-        gate.note_incoming(now)
+        cluster_hot = False
+        if (
+            self.cluster_gate_enabled
+            and self.cluster_window > 0.0
+            and self.cluster_bonus > 0
+            and self._session_enabled(sid, self.cluster_sessions)
+        ):
+            users, has_content = gate.cluster_stats(now, self.cluster_window)
+            cluster_hot = users >= self.cluster_min_users and has_content
+        gate.note_incoming(
+            now,
+            sender=self._event_sender(event),
+            low_value=scan.low_value,
+        )
 
         # Already deferred while busy: subsequent messages only enter the
         # buffer and are flushed together after the round ends (no re-scoring)
@@ -335,7 +424,9 @@ class NoriEngineChatPlugin(BasePlugin):
             logger.debug(f"[NoriEngineChat] 群聊时段休眠: sid={sid}")
             return
 
-        snapshot = self._build_snapshot(event, gate, now, idle_above_avg)
+        snapshot = self._build_snapshot(
+            event, gate, now, idle_above_avg, cluster_hot, scan
+        )
         verdict = evaluate_trigger_score(snapshot, self.wordlists)
 
         if verdict.score >= self.trigger_threshold:
@@ -346,7 +437,12 @@ class NoriEngineChatPlugin(BasePlugin):
         # Messages arriving inside an armed merge window are flushed with the
         # current round AND keep their accumulated credit — intentional
         # "topic heat inertia" (busy-deferred messages skip scoring instead)
-        gate.pending_score += verdict.score * group_chance
+        # The verdict's unscaled portion (topic-cluster bonus) bypasses the
+        # slot probability: diluting it by group_chance would negate the
+        # acceleration it exists to provide (poke scores accumulate raw
+        # the same way)
+        scaled = max(0.0, (verdict.score - verdict.unscaled) * group_chance)
+        gate.pending_score += scaled + verdict.unscaled
         if gate.pending_score >= self.trigger_threshold:
             accumulated = gate.pending_score
             logger.info(
@@ -376,18 +472,31 @@ class NoriEngineChatPlugin(BasePlugin):
             return datetime.now(tz).strftime("%H:%M")
         return datetime.now().strftime("%H:%M")
 
-    def _build_snapshot(
-        self,
-        event: KiraMessageEvent,
-        gate,
-        now: float,
-        idle_above_average: bool,
-    ) -> TriggerSnapshot:
-        """Build the scoring snapshot from the message event and session state.
+    @staticmethod
+    def _session_enabled(sid: str, scope: frozenset[str]) -> bool:
+        """Session-scope filter for the topic features: an empty scope means
+        global (enabled for every session); a non-empty scope enables only
+        the listed sessions."""
 
-        ``idle_above_average`` must be sampled by the caller BEFORE the
-        current message is recorded into the timeline (see handle_msg);
-        sampling after note_incoming would always see idle = 0.
+        return not scope or sid in scope
+
+    @staticmethod
+    def _event_sender(event: KiraMessageEvent) -> str:
+        """External sender user_id ("" when the adapter provides none);
+        sender-less timeline entries never count as cluster participants."""
+
+        sender = getattr(event.message, "sender", None)
+        return str(getattr(sender, "user_id", "") or "")
+
+    def _scan_chain(self, event: KiraMessageEvent) -> _ChainScan:
+        """Parse the message chain once: text segments, direct/media signal
+        flags, and the scoring-time low-content judgment (recorded with the
+        timeline entry for cluster detection).
+
+        ``low_value`` uses the same cleaned texts, the same media exemption
+        and the same configured wordlist as the verdict side inside
+        ``evaluate_trigger_score`` — media presence is itself engagement, so
+        any media segment exempts; empty/pure-reaction text batches do not.
         """
 
         has_at_bot = False
@@ -418,16 +527,61 @@ class NoriEngineChatPlugin(BasePlugin):
             elif isinstance(element, Text) and element.text:
                 texts.append(element.text)
 
+        cleaned = [t for t in (clean_chat_text(text) for text in texts) if t]
+        low_value = is_low_content_batch(
+            cleaned, self.wordlists.low_content_replies
+        ) and not (has_media or has_weak_media)
+        return _ChainScan(
+            texts=texts,
+            has_at_bot=has_at_bot,
+            has_media=has_media,
+            has_weak_media=has_weak_media,
+            low_value=low_value,
+        )
+
+    def _build_snapshot(
+        self,
+        event: KiraMessageEvent,
+        gate,
+        now: float,
+        idle_above_average: bool,
+        cluster_hot: bool = False,
+        scan: _ChainScan | None = None,
+    ) -> TriggerSnapshot:
+        """Build the scoring snapshot from the message event and session state.
+
+        ``idle_above_average`` and ``cluster_hot`` must be sampled by the
+        caller BEFORE the current message is recorded into the timeline
+        (see handle_msg); sampling after note_incoming would always see
+        idle = 0, and the current message must not complete the cluster
+        and then boost itself. ``scan`` is the caller's one-pass chain
+        parse (``_scan_chain``) computed before note_incoming — pass it to
+        avoid a second traversal; when omitted it is computed here.
+        """
+
+        scan = scan if scan is not None else self._scan_chain(event)
+
         bot_replies, window_total = gate.window_stats(
             self.presence_window_size, self.presence_decay_minutes, now
         )
         # Backlog is the recent burst count (external messages only, matching
         # the "batch" semantics), not the buffer length
         pending = gate.burst_count(now, self.burst_window)
+        # Topic continuity: inside the window anchored at the bot's last
+        # reply, every scored message earns the follow-up tier (a new bot
+        # reply re-anchors the window); scoped by followup_sessions
+        since_bot_reply = gate.seconds_since_last_bot_reply(now)
+        followup = (
+            self.followup_window > 0.0
+            and self.followup_score > 0
+            and self._session_enabled(str(event.session.sid), self.followup_sessions)
+            and since_bot_reply is not None
+            and since_bot_reply <= self.followup_window
+        )
 
         return TriggerSnapshot(
-            texts=texts,
-            has_at=has_at_bot,
+            texts=scan.texts,
+            has_at=scan.has_at_bot,
             has_mention=bool(event.is_mentioned),
             is_group_chat=True,
             pending_count=pending,
@@ -436,8 +590,12 @@ class NoriEngineChatPlugin(BasePlugin):
             recent_window_total=window_total,
             pace_factor=self.reply_pace,
             idle_above_average=idle_above_average,
-            has_media=has_media,
-            has_weak_media=has_weak_media,
+            has_media=scan.has_media,
+            has_weak_media=scan.has_weak_media,
+            followup=followup,
+            followup_score=self.followup_score,
+            cluster_hot=cluster_hot,
+            cluster_bonus=self.cluster_bonus,
         )
 
     # ------------------------------------------------------------------
@@ -477,7 +635,9 @@ class NoriEngineChatPlugin(BasePlugin):
         now = time.time()
 
         # Same as ordinary messages: buffer everything + record the activity
-        # timeline (dormant slots still keep the context)
+        # timeline (dormant slots still keep the context). Recorded bare
+        # (anonymous, low-value): a poke carries no discussion content, so
+        # it never counts as a cluster participant
         buffer = self.ctx.get_buffer(str(event.session))
         cap = self._buffer_cap(sid)
         if buffer is not None and buffer.get_length() >= cap:
@@ -731,19 +891,20 @@ class NoriEngineChatPlugin(BasePlugin):
             logger.info(f"[NoriEngineChat] LLM 回合结束({reason})，放行挂起触发: sid={sid}")
             self._arm_flush(sid)
 
-    async def _on_session_memory_updated(self, event) -> None:
-        """Host session_memory_updated event: the precise LLM round-end signal.
+    @on.final_result(priority=Priority.MEDIUM)
+    async def _on_final_result(self, event: KiraMessageBatchEvent, final_result, *_, **__) -> None:
+        """Host ON_FINAL_RESULT hook: the precise LLM round-end signal.
 
-        ``update_memory`` is the last step of every host batch round
-        (``handle_im_batch_message``) and the event payload carries the
-        session name; filtered by sid, it releases busy and re-arms any
-        deferred trigger. Paths that publish no event (e.g. save failures)
-        are backstopped by the watchdog.
+        Dispatched once per finished turn by ``handle_im_batch_message``
+        (after the agent loop, before memory persistence), unconditionally —
+        including silent turns and memory-save failures. Filtered by sid, it
+        releases busy and re-arms any deferred trigger. Paths that dispatch
+        no hook (early returns / mid-round exceptions) are backstopped by
+        the watchdog.
         """
-        payload = getattr(event, "payload", None)
-        sid = payload.get("session") if isinstance(payload, dict) else None
-        if sid and sid in self.busy_sessions:
-            self._release_busy(sid, reason="memory_updated")
+        sid = event.session.sid
+        if sid in self.busy_sessions:
+            self._release_busy(sid, reason="final_result")
 
     # ------------------------------------------------------------------
     # Presence tracking / group-chat prompt injection

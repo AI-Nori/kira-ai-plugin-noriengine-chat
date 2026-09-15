@@ -236,10 +236,20 @@ def _clamp_chance(value: object) -> float:
 @dataclass
 class TimelineEntry:
     """One timeline entry: when a message happened and whether it was the
-    bot's own message."""
+    bot's own message.
+
+    ``sender``: external sender user_id ("" for bot entries and records
+    without sender info — such entries never count toward the topic-cluster
+    distinct-sender total). ``low_value``: the scoring-time low-content
+    judgment recorded with the entry (content-less entries default to
+    low-value, mirroring ``is_low_content_batch([])`` semantics); the
+    cluster condition requires at least one non-low-value entry.
+    """
 
     ts: float
     from_bot: bool
+    sender: str = ""
+    low_value: bool = True
 
 
 class SessionGate:
@@ -258,10 +268,17 @@ class SessionGate:
         self.timeline: deque[TimelineEntry] = deque(maxlen=timeline_capacity)
 
     # -- timeline recording ---------------------------------------------
-    def note_incoming(self, ts: float) -> None:
-        """Record the arrival of one external message."""
+    def note_incoming(self, ts: float, sender: str = "", low_value: bool = True) -> None:
+        """Record the arrival of one external message.
 
-        self.timeline.append(TimelineEntry(ts=ts, from_bot=False))
+        ``sender``/``low_value`` feed topic-cluster detection; the defaults
+        (anonymous, low-value) keep content-less records — e.g. pokes —
+        from ever counting as cluster participants.
+        """
+
+        self.timeline.append(
+            TimelineEntry(ts=ts, from_bot=False, sender=sender, low_value=low_value)
+        )
 
     def note_bot_reply(self, ts: float) -> None:
         """Record one bot message (for presence statistics)."""
@@ -290,6 +307,35 @@ class SessionGate:
                 if not e.from_bot and 0 <= now_ts - e.ts <= window_seconds
             ),
         )
+
+    def seconds_since_last_bot_reply(self, now_ts: float) -> Optional[float]:
+        """Seconds since the bot's most recent message, or ``None`` when the
+        retained timeline holds no bot entry (anchors the follow-up window)."""
+
+        for entry in reversed(self.timeline):
+            if entry.from_bot:
+                return max(0.0, now_ts - entry.ts)
+        return None
+
+    def cluster_stats(self, now_ts: float, window_seconds: float) -> tuple[int, bool]:
+        """``(distinct external senders, any non-low-value entry)`` within
+        the last ``window_seconds`` — topic-cluster detection.
+
+        The bot's own entries are excluded. Sender-less entries ("" —
+        adapters without sender info, or content-less notices) never count
+        toward the distinct-sender total: a single anonymous record must
+        not impersonate any number of participants.
+        """
+
+        senders: set[str] = set()
+        has_content = False
+        for entry in self.timeline:
+            if entry.from_bot or not (0 <= now_ts - entry.ts <= window_seconds):
+                continue
+            if entry.sender:
+                senders.add(entry.sender)
+            has_content = has_content or not entry.low_value
+        return len(senders), has_content
 
     def window_stats(
         self,
