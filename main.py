@@ -33,9 +33,9 @@ Core behavior:
   participants (default 3) post real content within a window (default
   30s), every message scored while the topic is hot earns an additive
   bonus (default 50) that accumulates without slot-probability dilution;
-- Both topic features are session-scoped: an empty session list means
-  global, a non-empty list enables the feature only for the listed
-  sessions;
+- Both topic features share one session scope (``topic_focus_sessions``):
+  an empty session list means global, a non-empty list enables them only
+  for the listed sessions;
 - After a trigger, the whole buffer is flushed through a short merge window
   (debounce) and handed to the native KiraAI LLM pipeline;
 - LLM round serialization (busy queue): the host dispatches batch events
@@ -152,12 +152,12 @@ class NoriEngineChatPlugin(BasePlugin):
             except (TypeError, ValueError):
                 return fallback
 
-        def _as_sid_set(key: str) -> frozenset[str]:
+        def _as_sid_set(section: dict, key: str) -> frozenset[str]:
             """Session-scope list: empty/missing means global (enabled for
             every session); a non-empty list enables only the listed
             sessions. Invalid type falls back to global with a warning."""
 
-            raw = gate_cfg.get(key)
+            raw = section.get(key)
             if raw is None:
                 return frozenset()
             if not isinstance(raw, (list, tuple)):
@@ -200,32 +200,33 @@ class NoriEngineChatPlugin(BasePlugin):
         self.busy_hold_timeout = min(
             300.0, max(5.0, _as_float(gate_cfg, "busy_hold_timeout_seconds", 60.0))
         )
+        # -- Topic focus (continuity + cluster detection, both off by
+        #    default, both scoped by the same session list) --
+        topic_cfg = pc.get("section_topic", {}) or {}
         # Topic continuity: messages scored within this window after the
-        # bot's last reply earn the follow-up direct-signal tier (0 = off);
-        # followup_sessions scopes it — empty = global, otherwise only the
-        # listed sessions
+        # bot's last reply earn the follow-up direct-signal tier (0 = off)
         self.followup_window = min(
-            300.0, max(0.0, _as_float(gate_cfg, "followup_window_seconds", 0.0))
+            300.0, max(0.0, _as_float(topic_cfg, "followup_window_seconds", 0.0))
         )
         self.followup_score = max(
-            0, _as_int(gate_cfg, "followup_score", FOLLOWUP_BASE_POINTS)
+            0, _as_int(topic_cfg, "followup_score", FOLLOWUP_BASE_POINTS)
         )
-        self.followup_sessions = _as_sid_set("followup_sessions")
         # Topic-cluster detection: enough distinct participants with real
         # content inside the window make the topic "hot"; every message
         # scored while hot earns the bonus, accumulated without
         # slot-probability dilution. Master switch, off by default (same
-        # pattern as poke_gate_enabled); cluster_sessions scopes it the
-        # same way as followup_sessions
-        self.cluster_gate_enabled = bool(gate_cfg.get("cluster_gate_enabled", False))
+        # pattern as poke_gate_enabled)
+        self.cluster_gate_enabled = bool(topic_cfg.get("cluster_gate_enabled", False))
         self.cluster_window = min(
-            600.0, max(0.0, _as_float(gate_cfg, "cluster_window_seconds", 30.0))
+            600.0, max(0.0, _as_float(topic_cfg, "cluster_window_seconds", 30.0))
         )
-        self.cluster_min_users = max(1, _as_int(gate_cfg, "cluster_min_users", 3))
+        self.cluster_min_users = max(1, _as_int(topic_cfg, "cluster_min_users", 3))
         self.cluster_bonus = max(
-            0, _as_int(gate_cfg, "cluster_bonus", CLUSTER_BONUS_POINTS)
+            0, _as_int(topic_cfg, "cluster_bonus", CLUSTER_BONUS_POINTS)
         )
-        self.cluster_sessions = _as_sid_set("cluster_sessions")
+        # One shared scope for BOTH topic features: empty = global,
+        # otherwise only the listed sessions enable either feature
+        self.topic_focus_sessions = _as_sid_set(topic_cfg, "topic_focus_sessions")
 
         # -- Time-slot scheduling: prefer the visual parallel lists, keep the
         #    legacy JSON-array config as a fallback --
@@ -287,8 +288,8 @@ class NoriEngineChatPlugin(BasePlugin):
             "[NoriEngineChat] initialized: threshold=%d pace=%.2f group=%.2f private=%.2f "
             "merge_wait=%.1fs slots=%d wake_words=%d poke_gate=%s(+%d) "
             "poke_back=%s(cooldown=%.1fs max=%d) busy_queue=%d hold_timeout=%.0fs "
-            "followup=%s(window=%.0fs score=%d scope=%s) "
-            "cluster=%s(window=%.0fs users=%d bonus=%d scope=%s)",
+            "followup=%s(window=%.0fs score=%d) "
+            "cluster=%s(window=%.0fs users=%d bonus=%d) topic_scope=%s",
             self.trigger_threshold, self.reply_pace, self.group_reply_chance,
             self.private_reply_chance, self.merge_wait, len(self.time_slots),
             len(self.waking_words),
@@ -297,14 +298,13 @@ class NoriEngineChatPlugin(BasePlugin):
             self.busy_queue_max, self.busy_hold_timeout,
             "on" if self.followup_window > 0.0 and self.followup_score > 0 else "off",
             self.followup_window, self.followup_score,
-            "all" if not self.followup_sessions else f"{len(self.followup_sessions)}个会话",
             "on" if (
                 self.cluster_gate_enabled
                 and self.cluster_window > 0.0
                 and self.cluster_bonus > 0
             ) else "off",
             self.cluster_window, self.cluster_min_users, self.cluster_bonus,
-            "all" if not self.cluster_sessions else f"{len(self.cluster_sessions)}个会话",
+            "all" if not self.topic_focus_sessions else f"{len(self.topic_focus_sessions)}个会话",
         )
 
     async def terminate(self):
@@ -388,7 +388,7 @@ class NoriEngineChatPlugin(BasePlugin):
             self.cluster_gate_enabled
             and self.cluster_window > 0.0
             and self.cluster_bonus > 0
-            and self._session_enabled(sid, self.cluster_sessions)
+            and self._session_enabled(sid, self.topic_focus_sessions)
         ):
             users, has_content = gate.cluster_stats(now, self.cluster_window)
             cluster_hot = users >= self.cluster_min_users and has_content
@@ -569,12 +569,12 @@ class NoriEngineChatPlugin(BasePlugin):
         pending = gate.burst_count(now, self.burst_window)
         # Topic continuity: inside the window anchored at the bot's last
         # reply, every scored message earns the follow-up tier (a new bot
-        # reply re-anchors the window); scoped by followup_sessions
+        # reply re-anchors the window); scoped by topic_focus_sessions
         since_bot_reply = gate.seconds_since_last_bot_reply(now)
         followup = (
             self.followup_window > 0.0
             and self.followup_score > 0
-            and self._session_enabled(str(event.session.sid), self.followup_sessions)
+            and self._session_enabled(str(event.session.sid), self.topic_focus_sessions)
             and since_bot_reply is not None
             and since_bot_reply <= self.followup_window
         )

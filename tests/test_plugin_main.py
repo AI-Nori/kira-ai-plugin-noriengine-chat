@@ -1050,8 +1050,8 @@ class TestFollowupWindow:
         assert default_plugin.followup_window == 0.0
 
         plugin, ctx = _make_plugin(
-            {"section_trigger": {"followup_window_seconds": 10.0,
-                                 "group_reply_chance": 1.0,
+            {"section_topic": {"followup_window_seconds": 10.0},
+             "section_trigger": {"group_reply_chance": 1.0,
                                  "merge_wait_seconds": 0.1}}
         )
         gate = plugin.gates.get(GROUP_SID)
@@ -1101,11 +1101,11 @@ class TestClusterGate:
         assert default_plugin.cluster_window == 30.0
 
         plugin, ctx = _make_plugin(
-            {"section_trigger": {"cluster_gate_enabled": True,
-                                 "cluster_window_seconds": 30,
-                                 "cluster_min_users": 3,
-                                 "cluster_bonus": 50,
-                                 "group_reply_chance": 0.5,
+            {"section_topic": {"cluster_gate_enabled": True,
+                               "cluster_window_seconds": 30,
+                               "cluster_min_users": 3,
+                               "cluster_bonus": 50},
+             "section_trigger": {"group_reply_chance": 0.5,
                                  "merge_wait_seconds": 0.1}}
         )
 
@@ -1157,25 +1157,25 @@ class TestClusterGate:
 
 
 class TestTopicFeatureScope:
-    """Session scoping of the two topic features: an empty session list
-    means global, a non-empty list enables the feature only for the listed
-    sessions. One trunk per feature with an in-scope / out-of-scope branch."""
+    """One shared session scope (topic_focus_sessions) governs BOTH topic
+    features: an empty list means global, a non-empty list enables the
+    features only for the listed sessions. One trunk with an in-scope /
+    out-of-scope branch per feature."""
 
     def test_topic_features_session_scope(self):
-        # Branch 0: default scopes are empty → both features act globally
+        # Branch 0: default scope is empty → both features act globally
         default_plugin, _ = _make_plugin()
-        assert default_plugin.followup_sessions == frozenset()
-        assert default_plugin.cluster_sessions == frozenset()
+        assert default_plugin.topic_focus_sessions == frozenset()
 
         sid_scoped = "napcat:gm:444444"
         plugin, ctx = _make_plugin(
-            {"section_trigger": {
+            {"section_topic": {
                 "followup_window_seconds": 10,
-                "followup_sessions": [GROUP_SID],
                 "cluster_gate_enabled": True,
-                "cluster_sessions": [sid_scoped],
-                "group_reply_chance": 1.0,
-            }}
+                # One list scoping BOTH features
+                "topic_focus_sessions": [GROUP_SID, sid_scoped],
+            },
+             "section_trigger": {"group_reply_chance": 1.0}}
         )
 
         async def scenario():
@@ -1195,7 +1195,8 @@ class TestTopicFeatureScope:
             assert gate_b.pending_score == 0.0
 
             # Cluster branch: identical 3-user hot clusters on both sessions
-            # — only the in-scope one gets the bonus (71 vs 21)
+            # — the SAME shared scope decides (in-scope sid_scoped gets the
+            # bonus 71, out-of-scope 21)
             gate_c = plugin.gates.get(sid_scoped)
             gate_c.note_incoming(now - 25, sender="u1", low_value=False)
             gate_c.note_incoming(now - 20, sender="u2", low_value=False)

@@ -1,7 +1,7 @@
 {
   "display_name": "NoriEngine Chat",
   "plugin_id": "kira-ai-plugin-noriengine-chat",
-  "version": "1.4.5",
+  "version": "1.4.6",
   "core_version": ">=2.34.4",
   "author": "skyzhishui",
   "description": "KiraAI 群聊增强插件。评分引擎决定 AI 何时参与对话：强信号直通、弱信号累积、时段调度、存在感抑制、戳一戳评分与机械回戳。启用本插件前请先停用 默认聊天。",
